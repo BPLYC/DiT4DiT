@@ -169,37 +169,20 @@ class baseframework(PreTrainedModel):
         return keys
 
     @staticmethod
-    def unnormalize_actions(normalized_actions: np.ndarray, action_norm_stats: Dict[str, np.ndarray]) -> np.ndarray:
+    def unnormalize_actions(normalized_actions: np.ndarray, action_norm_stats: Dict[str, np.ndarray], *, normalization: str = None) -> np.ndarray:
+        """Require an explicit dataset contract; never infer it from stats keys.
+
+        Historical callers silently selected quantile statistics for LIBERO
+        min/max training. Unknown contracts must fail before producing actions.
         """
-        Map normalized actions (≈[-1, 1]) back to original value range.
-
-        Steps:
-            - Clamp values to [-1, 1]
-            - Threshold channel index 6 to {0,1} (binary semantic)
-            - Apply linear scaling for masked dimensions using:
-                original = 0.5 * (norm + 1) * (q99 - q01) + q01
-
-        Args:
-            normalized_actions: Array shape [T, D] (or chunk length × action_dim).
-            action_norm_stats: Dict containing:
-                q01 (array-like): Lower percentile (per-dimension).
-                q99 (array-like): Upper percentile (per-dimension).
-                mask (optional bool array): True => apply de-normalization; False => keep original normalized value.
-
-        Returns:
-            np.ndarray: Unnormalized actions (same shape as input).
-        """
-        mask = action_norm_stats.get("mask", np.ones_like(action_norm_stats["q01"], dtype=bool))
-        action_high, action_low = np.array(action_norm_stats["q99"]), np.array(action_norm_stats["q01"])
-        normalized_actions = np.clip(normalized_actions, -1, 1)
-        normalized_actions[:, 6] = np.where(normalized_actions[:, 6] < 0.5, 0, 1)
-        actions = np.where(
-            mask,
-            0.5 * (normalized_actions + 1) * (action_high - action_low) + action_low,
-            normalized_actions,
-        )
-
-        return actions
+        if normalization != "libero_minmax":
+            raise ValueError(
+                "ACTION_NORMALIZATION_CONTRACT_REQUIRED: use normalization='libero_minmax' "
+                "only for LIBERO; other datasets require their verified task adapter. "
+                "Implicit q01/q99 conversion has been removed."
+            )
+        from DiT4DiT.model.framework.libero_action_contract import unnormalize_libero_actions
+        return unnormalize_libero_actions(normalized_actions, action_norm_stats)
 
     @staticmethod
     def _check_unnorm_key(norm_stats, unnorm_key):
