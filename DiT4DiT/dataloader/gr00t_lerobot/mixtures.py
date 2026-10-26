@@ -26,6 +26,14 @@ DATASET_NAMED_MIXTURES = {
         ("libero_spatial_no_noops_1.0.0_lerobot", 1.0, "libero_franka"),
         ("libero_10_no_noops_1.0.0_lerobot", 1.0, "libero_franka"),
     ],
+
+    # Exact names of the already-mounted paired roots used by the 2026-10-25 adapter validation.
+    "libero_all_paired_current": [
+        ("libero_object_no_noops_lerobot", 1.0, "libero_franka"),
+        ("libero_goal_no_noops_lerobot", 1.0, "libero_franka"),
+        ("libero_spatial_no_noops_lerobot", 1.0, "libero_franka"),
+        ("libero_10_no_noops_lerobot", 1.0, "libero_franka"),
+    ],
     
     "bridge": [
         ("bridge_orig_1.0.0_lerobot", 1.0, "oxe_bridge"),

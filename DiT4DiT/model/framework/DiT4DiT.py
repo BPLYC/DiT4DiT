@@ -115,6 +115,10 @@ class DiT4DiT(baseframework):
         # All video frames (condition + future) are already in batch_images;
         # build_cosmos_inputs splits them into videos (cond) and future_videos internally.
         backbone_inputs = self.backbone_interface.build_cosmos_inputs(images=batch_images, instructions=instructions)
+        adapter_active = self.action_model is not None and self.action_model.view_adapter is not None
+        adapter_train_route = kwargs.pop("adapter_train_route", None)
+        if adapter_active:
+            backbone_inputs["camera_tile_split"] = 0.5
         with torch.autocast("cuda", dtype=torch.bfloat16):
             backbone_outputs = self.backbone_interface(
                 **backbone_inputs,
@@ -165,7 +169,14 @@ class DiT4DiT(baseframework):
                 )
                 state_repeated = state.repeat(repeated_diffusion_steps, 1, 1)
 
-            action_loss = self.action_model(last_hidden_repeated, actions_target_repeated, action_mask, state_repeated)  # (B, chunk_len, action_dim)
+            action_loss = self.action_model(
+                last_hidden_repeated,
+                actions_target_repeated,
+                action_mask,
+                state_repeated,
+                token_layout=backbone_outputs.token_layout,
+                adapter_train_route=adapter_train_route,
+            )  # (B, chunk_len, action_dim)
 
         out = {"action_loss": action_loss}
         if future_video_loss is not None:
@@ -189,6 +200,10 @@ class DiT4DiT(baseframework):
         """
         if type(examples) is not list:
             examples = [examples]
+        adapter_active = self.action_model is not None and self.action_model.view_adapter is not None
+        route_mode = kwargs.pop("route_mode", "router" if adapter_active else "0")
+        fixed_seed = kwargs.pop("fixed_seed", None)
+        initial_noise = kwargs.pop("initial_noise", None)
         batch_images = []
         for ex in examples:
             img = ex["image"]
@@ -204,6 +219,10 @@ class DiT4DiT(baseframework):
     
         # Step 1: backbone input format
         backbone_inputs = self.backbone_interface.build_cosmos_inputs(images=batch_images, instructions=instructions)
+        if adapter_active:
+            backbone_inputs["camera_tile_split"] = 0.5
+        if fixed_seed is not None:
+            backbone_inputs["fixed_seed"] = int(fixed_seed)
         with torch.autocast("cuda", dtype=torch.bfloat16):
             backbone_outputs = self.backbone_interface(
                 **backbone_inputs,
@@ -219,10 +238,19 @@ class DiT4DiT(baseframework):
         
         # Step 4: Action Expert Forward
         with torch.autocast("cuda", dtype=torch.float32):
-            pred_actions = self.action_model.predict_action(last_hidden, state)  # (B, chunk_len, action_dim)
+            pred_actions = self.action_model.predict_action(
+                last_hidden,
+                state,
+                token_layout=backbone_outputs.token_layout,
+                route_mode=route_mode,
+                initial_noise=initial_noise,
+            )  # (B, chunk_len, action_dim)
 
         normalized_actions = pred_actions.detach().cpu().numpy()
-        return {"normalized_actions": normalized_actions}
+        out = {"normalized_actions": normalized_actions}
+        if adapter_active and self.action_model._last_route_ids is not None:
+            out["route_ids"] = self.action_model._last_route_ids.cpu().numpy()
+        return out
 
 
 

@@ -45,6 +45,9 @@ from DiT4DiT.dataloader.gr00t_lerobot.schema import (
     DatasetMetadata,
     DatasetStatisticalValues,
     LeRobotModalityMetadata,
+    LeRobotModalityField,
+    LeRobotStateMetadata,
+    LeRobotActionMetadata,
     LeRobotStateActionMetadata,
 )
 from DiT4DiT.dataloader.gr00t_lerobot.transform import ComposedModalityTransform
@@ -176,6 +179,8 @@ class LeRobotSingleDataset(Dataset):
 
         self._dataset_path = Path(dataset_path)
         self._dataset_name = self._dataset_path.name
+        configured_steps_cache = self.data_cfg.get("steps_cache_dir") if self.data_cfg is not None else None
+        self._steps_cache_dir = Path(configured_steps_cache) if configured_steps_cache else None
         if isinstance(embodiment_tag, EmbodimentTag):
             self.tag = embodiment_tag.value
         else:
@@ -304,15 +309,11 @@ class LeRobotSingleDataset(Dataset):
             dict: The metadata for the dataset.
         """
 
-        # 1. Modality metadata
-        modality_meta_path = self.dataset_path / LE_ROBOT_MODALITY_FILENAME
-        assert (
-            modality_meta_path.exists()
-        ), f"Please provide a {LE_ROBOT_MODALITY_FILENAME} file in {self.dataset_path}"
+        # 1. Modality metadata. Some mounted LIBERO v2.1 roots do not include
+        # modality.json; derive the narrow LIBERO/franka contract in memory.
         # 1.1. State and action modalities
         simplified_modality_meta: dict[str, dict] = {}
-        with open(modality_meta_path, "r") as f:
-            le_modality_meta = LeRobotModalityMetadata.model_validate(json.load(f))
+        le_modality_meta = self._load_lerobot_modality_meta()
         for modality in ["state", "action"]:
             simplified_modality_meta[modality] = {}
             le_state_action_meta: dict[str, LeRobotStateActionMetadata] = getattr(
@@ -346,16 +347,28 @@ class LeRobotSingleDataset(Dataset):
             if original_key is None:
                 original_key = new_key
             le_video_meta = le_info["features"][original_key]
-            height = le_video_meta["shape"][le_video_meta["names"].index("height")]
-            width = le_video_meta["shape"][le_video_meta["names"].index("width")]
-            # NOTE(FH): different lerobot dataset versions have different keys for the number of channels and fps
-            try:
-                channels = le_video_meta["shape"][le_video_meta["names"].index("channel")]
-                fps = le_video_meta["video_info"]["video.fps"]
-            except (ValueError, KeyError):
-                # channels = le_video_meta["shape"][le_video_meta["names"].index("channels")]
-                channels = le_video_meta["info"]["video.channels"]
-                fps = le_video_meta["info"]["video.fps"]
+            names = le_video_meta.get("names", [])
+            shape = le_video_meta.get("shape", [])
+            feature_info = le_video_meta.get("info", {})
+            video_info = le_video_meta.get("video_info", {})
+            if "height" in names and "width" in names:
+                height = shape[names.index("height")]
+                width = shape[names.index("width")]
+            elif len(shape) >= 2:
+                height, width = shape[:2]
+            else:
+                height = feature_info.get("video.height")
+                width = feature_info.get("video.width")
+            channel_name = "channel" if "channel" in names else "channels" if "channels" in names else None
+            if channel_name is not None:
+                channels = shape[names.index(channel_name)]
+            elif len(shape) == 3:
+                channels = shape[2]
+            else:
+                channels = feature_info.get("video.channels", le_video_meta.get("channels"))
+            fps = video_info.get("video.fps", feature_info.get("video.fps", le_video_meta.get("fps")))
+            if height is None or width is None or channels is None or fps is None:
+                raise ValueError(f"Incomplete video shape/fps metadata for {original_key}: {le_video_meta}")
             simplified_modality_meta["video"][new_key] = {
                 "resolution": [width, height],
                 "channels": channels,
@@ -363,27 +376,7 @@ class LeRobotSingleDataset(Dataset):
             }
 
         # 2. Dataset statistics
-        stats_path = self.dataset_path / LE_ROBOT_STATS_FILENAME
-        try:
-            with open(stats_path, "r") as f:
-                le_statistics = json.load(f)
-            for stat in le_statistics.values():
-                DatasetStatisticalValues.model_validate(stat)
-        except (FileNotFoundError, ValidationError) as e:
-            print(f"Failed to load dataset statistics: {e}")
-            print(f"Calculating dataset statistics for {self.dataset_name}")
-            # Get all parquet files in the dataset paths
-            parquet_files = list((self.dataset_path).glob(LE_ROBOT_DATA_FILENAME))
-            parquet_files_filtered = []
-            #  parquet_files[0].name = "episode_033675.parquet" is broken file
-            for pf in parquet_files:
-                if "episode_033675.parquet" in pf.name:
-                    continue
-                parquet_files_filtered.append(pf)
-            
-            le_statistics = calculate_dataset_statistics(parquet_files_filtered)
-            with open(stats_path, "w") as f:
-                json.dump(le_statistics, f, indent=4)
+        le_statistics = self._load_lerobot_statistics()
         dataset_statistics = {}
         for our_modality in ["state", "action"]:
             dataset_statistics[our_modality] = {}
@@ -408,6 +401,163 @@ class LeRobotSingleDataset(Dataset):
         )
 
         return metadata
+
+    def _is_supported_libero_v21_root(self, info: dict) -> bool:
+        version = str(info.get("codebase_version", ""))
+        return (
+            self.dataset_name.startswith("libero_")
+            and str(info.get("robot_type", "")).lower() == "franka"
+            and version.startswith("v2.1")
+        )
+
+    def _load_lerobot_modality_meta(self) -> LeRobotModalityMetadata:
+        modality_meta_path = self.dataset_path / LE_ROBOT_MODALITY_FILENAME
+        if modality_meta_path.exists():
+            with open(modality_meta_path, "r", encoding="utf-8") as f:
+                return LeRobotModalityMetadata.model_validate(json.load(f))
+
+        info_path = self.dataset_path / LE_ROBOT_INFO_FILENAME
+        if not info_path.exists():
+            raise FileNotFoundError(f"Missing both {LE_ROBOT_MODALITY_FILENAME} and {LE_ROBOT_INFO_FILENAME} in {self.dataset_path}")
+        with open(info_path, "r", encoding="utf-8") as f:
+            info = json.load(f)
+        if not self._is_supported_libero_v21_root(info):
+            raise FileNotFoundError(
+                f"Please provide {LE_ROBOT_MODALITY_FILENAME}; in-memory inference is limited to LIBERO Franka v2.1 roots"
+            )
+
+        features = info.get("features", {})
+        state_feature = features.get("observation.state")
+        action_feature = features.get("action")
+        if not isinstance(state_feature, dict) or not isinstance(action_feature, dict):
+            raise ValueError(f"LIBERO info.json is missing observation.state/action features in {self.dataset_path}")
+
+        def feature_width(feature: dict) -> int:
+            shape = feature.get("shape")
+            if not isinstance(shape, list) or len(shape) != 1:
+                raise ValueError(f"Expected one-dimensional LIBERO low-dimensional feature, got {shape!r}")
+            return int(shape[0])
+
+        def configured_keys(modality: str, feature: dict, source_key: str, absolute: bool):
+            cfg = self.modality_configs.get(modality)
+            keys = list(cfg.modality_keys) if cfg is not None else []
+            width = feature_width(feature)
+            if len(keys) != width or not keys or any(not key.startswith(modality + ".") for key in keys):
+                raise ValueError(
+                    f"LIBERO {modality} feature width {width} does not match configured ordered keys {keys}"
+                )
+            dtype = str(feature.get("dtype", "float32"))
+            result = {}
+            model_type = LeRobotStateMetadata if modality == "state" else LeRobotActionMetadata
+            for index, full_key in enumerate(keys):
+                subkey = full_key[len(modality) + 1 :]
+                result[subkey] = model_type(
+                    original_key=source_key,
+                    start=index,
+                    end=index + 1,
+                    dtype=dtype,
+                    absolute=absolute,
+                )
+            return result
+
+        video_features = {
+            key: value
+            for key, value in features.items()
+            if key.startswith("observation.images.") and isinstance(value, dict)
+        }
+        configured_video = self.modality_configs.get("video")
+        video_keys = list(configured_video.modality_keys) if configured_video is not None else []
+        non_wrist = [key for key in video_features if "wrist" not in key.lower()]
+        wrist = [key for key in video_features if "wrist" in key.lower()]
+        if len(video_keys) != 2 or len(non_wrist) != 1 or len(wrist) != 1:
+            raise ValueError(
+                f"Expected one scene and one wrist LIBERO video feature, got configured={video_keys}, available={list(video_features)}"
+            )
+        video_meta = {
+            video_keys[0].split(".", 1)[1]: LeRobotModalityField(original_key=non_wrist[0]),
+            video_keys[1].split(".", 1)[1]: LeRobotModalityField(original_key=wrist[0]),
+        }
+        language_keys = list(self.modality_configs.get("language").modality_keys)
+        if len(language_keys) != 1 or not language_keys[0].startswith("annotation."):
+            raise ValueError(f"Expected one configured LIBERO language key, got {language_keys}")
+        annotation_key = language_keys[0].replace("annotation.", "", 1)
+
+        return LeRobotModalityMetadata.model_validate(
+            {
+                "state": configured_keys("state", state_feature, "observation.state", absolute=True),
+                "action": configured_keys("action", action_feature, "action", absolute=False),
+                "video": video_meta,
+                "annotation": {annotation_key: {"original_key": "task_index"}},
+            }
+        )
+
+    def _load_lerobot_statistics(self) -> dict:
+        stats_path = self.dataset_path / LE_ROBOT_STATS_FILENAME
+        if stats_path.exists():
+            try:
+                with open(stats_path, "r", encoding="utf-8") as f:
+                    stats = json.load(f)
+                for stat in stats.values():
+                    DatasetStatisticalValues.model_validate(stat)
+                return stats
+            except (json.JSONDecodeError, ValidationError) as exc:
+                print(f"Ignoring invalid {stats_path} and reading existing per-episode statistics: {exc}")
+
+        episode_stats_path = self.dataset_path / "meta" / "episodes_stats.jsonl"
+        if episode_stats_path.exists():
+            accumulated: dict[str, list[dict[str, np.ndarray]]] = defaultdict(list)
+            with open(episode_stats_path, "r", encoding="utf-8") as f:
+                for line_number, line in enumerate(f, 1):
+                    if not line.strip():
+                        continue
+                    row = json.loads(line)
+                    payload = row.get("stats", row)
+                    for key in ("observation.state", "action"):
+                        block = payload.get(key)
+                        if not isinstance(block, dict) or not all(
+                            stat in block for stat in ("min", "max", "mean", "std", "count")
+                        ):
+                            continue
+                        values = {name: np.asarray(block[name], dtype=np.float64) for name in ("min", "max", "mean", "std")}
+                        count = np.asarray(block["count"], dtype=np.float64)
+                        if count.size == 1:
+                            count = np.full(values["mean"].shape, float(count.reshape(-1)[0]), dtype=np.float64)
+                        if count.shape != values["mean"].shape:
+                            raise ValueError(f"Invalid count shape in {episode_stats_path}:{line_number}: {count.shape}")
+                        values["count"] = count
+                        accumulated[key].append(values)
+            result = {}
+            for key, rows in accumulated.items():
+                if not rows:
+                    continue
+                counts = np.stack([row["count"] for row in rows])
+                total = counts.sum(axis=0)
+                if np.any(total <= 0):
+                    raise ValueError(f"Nonpositive episode-stat count for {key} in {episode_stats_path}")
+                means = np.stack([row["mean"] for row in rows])
+                mean = (means * counts).sum(axis=0) / total
+                variance = (
+                    np.stack([row["std"] ** 2 + row["mean"] ** 2 for row in rows]) * counts
+                ).sum(axis=0) / total - mean**2
+                result[key] = {
+                    "min": np.stack([row["min"] for row in rows]).min(axis=0).tolist(),
+                    "max": np.stack([row["max"] for row in rows]).max(axis=0).tolist(),
+                    "mean": mean.tolist(),
+                    "std": np.sqrt(np.maximum(variance, 0.0)).tolist(),
+                    # Current LIBERO4in1 transforms use min_max for the six controller dimensions;
+                    # episode_stats.jsonl does not contain exact percentiles.
+                    "q01": np.stack([row["min"] for row in rows]).min(axis=0).tolist(),
+                    "q99": np.stack([row["max"] for row in rows]).max(axis=0).tolist(),
+                }
+            if "observation.state" in result and "action" in result:
+                return result
+
+        print(f"Calculating missing statistics in memory for {self.dataset_name}; shared dataset files will not be written")
+        parquet_files = sorted(self.dataset_path.glob(LE_ROBOT_DATA_FILENAME))
+        parquet_files = [path for path in parquet_files if "episode_033675.parquet" not in path.name]
+        if not parquet_files:
+            raise FileNotFoundError(f"No usable per-episode statistics or parquet files found under {self.dataset_path}")
+        return calculate_dataset_statistics(parquet_files)
 
     def _get_trajectories(self) -> tuple[np.ndarray, np.ndarray]:
         """Get the trajectories in the dataset."""
@@ -464,7 +614,11 @@ class LeRobotSingleDataset(Dataset):
         # fast get static steps @fangjing --> don't use hash to dynamic sample
         # 
         steps_filename =  "steps_data_index.pkl"
-        steps_path = self.dataset_path / "meta" / steps_filename
+        steps_path = (
+            self._steps_cache_dir / f"{self.dataset_name}_{steps_filename}"
+            if self._steps_cache_dir is not None
+            else self.dataset_path / "meta" / steps_filename
+        )
         
         # Try to load cached steps first
         try:
@@ -676,13 +830,7 @@ class LeRobotSingleDataset(Dataset):
 
     def _get_lerobot_modality_meta(self) -> LeRobotModalityMetadata:
         """Get the metadata for the LeRobot dataset."""
-        modality_meta_path = self.dataset_path / LE_ROBOT_MODALITY_FILENAME
-        assert (
-            modality_meta_path.exists()
-        ), f"Please provide a {LE_ROBOT_MODALITY_FILENAME} file in {self.dataset_path}"
-        with open(modality_meta_path, "r") as f:
-            modality_meta = LeRobotModalityMetadata.model_validate(json.load(f))
-        return modality_meta
+        return self._load_lerobot_modality_meta()
 
     def _get_lerobot_info_meta(self) -> dict:
         """Get the metadata for the LeRobot dataset."""
@@ -1501,6 +1649,53 @@ class LeRobotMixtureDataset(Dataset):
         self.seed = seed
         self.mode = mode
         self.data_cfg = kwargs["data_cfg"] if "data_cfg" in kwargs else None
+        self.episode_filter = kwargs.get("episode_filter")
+        self.sample_plan = kwargs.get("sample_plan")
+        self.complete_action_windows_only = bool(kwargs.get("complete_action_windows_only", False))
+        self.required_action_window = max(
+            (int(np.max(dataset.delta_indices[key])) + 1
+             for dataset in self.datasets
+             for key in dataset.modality_keys.get("action", [])),
+            default=1,
+        )
+        self._eligible_trajectory_indices: list[np.ndarray] | None = None
+        self._eligible_episode_ids: dict[str, set[int]] | None = None
+        if self.episode_filter is not None:
+            self._eligible_trajectory_indices = []
+            self._eligible_episode_ids = {}
+            for dataset in self.datasets:
+                allowed = self.episode_filter.get(dataset.dataset_name)
+                if allowed is None:
+                    raise ValueError(f"episode_filter has no entry for {dataset.dataset_name}")
+                allowed_ids = {int(value) for value in allowed}
+                self._eligible_episode_ids[dataset.dataset_name] = allowed_ids
+                present_ids = {int(value) for value in dataset.trajectory_ids}
+                missing_ids = allowed_ids - present_ids
+                if missing_ids:
+                    raise ValueError(
+                        f"episode_filter includes {len(missing_ids)} missing episodes from "
+                        f"{dataset.dataset_name}: {sorted(missing_ids)[:10]}"
+                    )
+                eligible = np.asarray(
+                    [i for i, episode_id in enumerate(dataset.trajectory_ids) if int(episode_id) in allowed_ids],
+                    dtype=np.int64,
+                )
+                if self.complete_action_windows_only:
+                    short = eligible[
+                        dataset.trajectory_lengths[eligible] < self.required_action_window
+                    ]
+                    if short.size:
+                        short_ids = dataset.trajectory_ids[short].astype(int).tolist()
+                        raise ValueError(
+                            f"D_E includes {len(short_ids)} episodes shorter than the complete "
+                            f"{self.required_action_window}-step action window in {dataset.dataset_name}: {short_ids[:10]}"
+                        )
+                    eligible = eligible[
+                        dataset.trajectory_lengths[eligible] >= self.required_action_window
+                    ]
+                if eligible.size == 0:
+                    raise ValueError(f"episode_filter selected no eligible episodes from {dataset.dataset_name}")
+                self._eligible_trajectory_indices.append(eligible)
 
         # Set properties for sampling
 
@@ -1614,6 +1809,34 @@ class LeRobotMixtureDataset(Dataset):
 
     def sample_step(self, index: int) -> tuple[LeRobotSingleDataset, int, int]:
         """Sample a single step from the dataset."""
+        if self.sample_plan is not None:
+            item = self.sample_plan[index % len(self.sample_plan)]
+            dataset_index = next(
+                (i for i, dataset in enumerate(self.datasets) if dataset.dataset_name == item["dataset_name"]),
+                None,
+            )
+            if dataset_index is None:
+                raise ValueError(f"sample_plan names unknown dataset {item['dataset_name']!r}")
+            dataset = self.datasets[dataset_index]
+            trajectory_id = int(item["episode_index"])
+            if trajectory_id not in {int(x) for x in dataset.trajectory_ids}:
+                raise ValueError(f"sample_plan episode {trajectory_id} is absent from {dataset.dataset_name}")
+            if (
+                self._eligible_episode_ids is not None
+                and trajectory_id not in self._eligible_episode_ids[dataset.dataset_name]
+            ):
+                raise ValueError(
+                    f"sample_plan episode {trajectory_id} is outside the selected split for {dataset.dataset_name}"
+                )
+            base_index = int(item["frame_index"])
+            episode_pos = int(np.where(dataset.trajectory_ids == trajectory_id)[0][0])
+            max_base = int(dataset.trajectory_lengths[episode_pos]) - (
+                self.required_action_window if self.complete_action_windows_only else 0
+            )
+            if not 0 <= base_index <= max_base:
+                raise ValueError(f"sample_plan frame {base_index} is outside episode {trajectory_id}")
+            return dataset, trajectory_id, base_index
+
         # return self.sampled_steps[index]
 
         # Set seed
@@ -1633,8 +1856,38 @@ class LeRobotMixtureDataset(Dataset):
         # # Sample step
         # base_index = rng.choice(dataset.trajectory_lengths[trajectory_index])
         # return dataset, trajectory_id, base_index
-        single_step_index = rng.choice(len(dataset.all_steps))
-        trajectory_id, base_index = dataset.all_steps[single_step_index]
+        if self.complete_action_windows_only:
+            if self._eligible_trajectory_indices is None:
+                trajectory_indices = np.arange(len(dataset.trajectory_ids), dtype=np.int64)
+                trajectory_indices = trajectory_indices[
+                    dataset.trajectory_lengths[trajectory_indices] >= self.required_action_window
+                ]
+            else:
+                trajectory_indices = self._eligible_trajectory_indices[dataset_index]
+            if trajectory_indices.size == 0:
+                raise ValueError(f"No complete action windows in {dataset.dataset_name}")
+            lengths = dataset.trajectory_lengths[trajectory_indices].astype(np.int64)
+            weights = np.maximum(lengths - self.required_action_window + 1, 1).astype(np.float64)
+            if not self.balance_trajectory_weights:
+                weights[:] = 1.0
+            weights /= weights.sum()
+            trajectory_index = int(rng.choice(trajectory_indices, p=weights))
+            trajectory_id = int(dataset.trajectory_ids[trajectory_index])
+            valid_starts = int(dataset.trajectory_lengths[trajectory_index]) - self.required_action_window + 1
+            base_index = int(rng.integers(valid_starts))
+        elif self._eligible_trajectory_indices is None:
+            single_step_index = rng.choice(len(dataset.all_steps))
+            trajectory_id, base_index = dataset.all_steps[single_step_index]
+        else:
+            eligible = self._eligible_trajectory_indices[dataset_index]
+            if self.balance_trajectory_weights:
+                weights = dataset.trajectory_lengths[eligible].astype(np.float64)
+                weights /= weights.sum()
+                trajectory_index = int(rng.choice(eligible, p=weights))
+            else:
+                trajectory_index = int(rng.choice(eligible))
+            trajectory_id = int(dataset.trajectory_ids[trajectory_index])
+            base_index = int(rng.integers(int(dataset.trajectory_lengths[trajectory_index])))
         return dataset, trajectory_id, base_index
 
     def __getitem__(self, index: int) -> dict:
@@ -1812,6 +2065,9 @@ class LeRobotMixtureDataset(Dataset):
                     state=state,
                     action_mask=action_mask,
                     state_mask=state_mask,
+                    source_dataset=dataset.dataset_name,
+                    episode_index=int(trajectory_id),
+                    frame_index=int(step),
                 )
                 return out
                 
@@ -1837,6 +2093,9 @@ class LeRobotMixtureDataset(Dataset):
         Returns:
             int: The length of a single epoch in the mixture.
         """
+        if self.sample_plan is not None:
+            return len(self.sample_plan)
+
         # Check for potential issues
         if len(self.datasets) == 0:
             return 0

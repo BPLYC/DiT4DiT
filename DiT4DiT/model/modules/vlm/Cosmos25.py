@@ -32,6 +32,7 @@ class BackboneOutput:
     hidden_states: List[torch.Tensor]
     future_video_loss: Optional[torch.Tensor] = None
     pred_future_video: Optional[torch.Tensor] = None  # (B,T,3,H,W) in [0,1] if returned
+    token_layout: Optional[dict[str, Any]] = None
 
 
 class _DefaultDummySafetyChecker:
@@ -198,6 +199,7 @@ class Cosmos25FeatureExtractor(nn.Module):
                 max_length=max_sequence_length,
                 truncation=True,
                 padding="max_length",
+                return_dict=False,
             )
             input_ids_batch.append(torch.LongTensor(input_ids))
 
@@ -1027,13 +1029,14 @@ class _Cosmos25_Interface(nn.Module):
         return_dict: bool = True,
         future_videos: Optional[torch.Tensor] = None,
         predict_future: bool = False,
+        camera_tile_split: Optional[float] = None,
         **kwargs,
     ):
         _ = kwargs
 
         future_loss = None
         pred_future_video = None
-        fixed_seed = 42
+        fixed_seed = kwargs.pop("fixed_seed", None)
         # future_videos = None
 
         cosmos_cfg = getattr(self.config.framework, "cosmos25", None) if self.config is not None else None
@@ -1065,6 +1068,7 @@ class _Cosmos25_Interface(nn.Module):
                 num_inference_steps=future_steps,
                 num_frames_out=train_num_frames_out,
                 conditional_frame_timestep=conditional_frame_timestep,
+                fixed_seed=fixed_seed,
             )
         else:
             hidden = self.extractor(
@@ -1075,12 +1079,41 @@ class _Cosmos25_Interface(nn.Module):
                 detach=True,
                 num_frames_out=train_num_frames_out,
                 conditional_frame_timestep=conditional_frame_timestep,
+                fixed_seed=fixed_seed,
             )
 
         bsd = self._hidden_to_bsd(hidden)
 
+        token_layout = None
+        if camera_tile_split is not None:
+            from DiT4DiT.model.modules.action_model.view_residual_experts import build_camera_token_layout
+
+            if train_num_frames_out is None:
+                n_out = int(videos.shape[1])
+                if future_videos is not None:
+                    n_out += int(future_videos.shape[1])
+                n_out = max(n_out, 1 + max(1, int(getattr(self.extractor, "vae_scale_factor_temporal", 1) or 1)))
+            else:
+                n_out = int(train_num_frames_out)
+            token_layout = build_camera_token_layout(
+                hidden=bsd,
+                pixel_height=int(height),
+                pixel_width=int(width),
+                camera_split=float(camera_tile_split),
+                patch_size=tuple(int(x) for x in self.extractor.transformer.config.patch_size),
+                vae_spatial_scale=int(self.extractor.vae_scale_factor_spatial),
+                vae_temporal_scale=int(self.extractor.vae_scale_factor_temporal or 1),
+                num_frames_in=int(videos.shape[1]),
+                num_frames_out=n_out,
+            )
+
         # hidden_states = [bsd for _ in range(self.num_vl_layers)] if output_hidden_states else []
-        out = BackboneOutput(hidden_states=[bsd], future_video_loss=future_loss, pred_future_video=pred_future_video)
+        out = BackboneOutput(
+            hidden_states=[bsd],
+            future_video_loss=future_loss,
+            pred_future_video=pred_future_video,
+            token_layout=token_layout,
+        )
         # return out if return_dict else (out.hidden_states,)
         return out
 

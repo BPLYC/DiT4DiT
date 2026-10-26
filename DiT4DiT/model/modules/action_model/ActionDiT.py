@@ -22,6 +22,7 @@ from DiT4DiT.model.modules.action_model.flow_matching_head.action_encoder import
 )
 
 from DiT4DiT.model.modules.action_model.flow_matching_head.cross_attention_dit import DiT
+from DiT4DiT.model.modules.action_model.view_residual_experts import CameraSupportedVelocityResidualAdapter
 
 
 class CategorySpecificLinear(nn.Module):
@@ -256,6 +257,22 @@ class FlowmatchingActionHead(nn.Module):
         self.beta_dist = Beta(config.noise_beta_alpha, config.noise_beta_beta)
         self.num_timestep_buckets = config.num_timestep_buckets
         self.config = config
+        # Kept absent from the original checkpoint state dict; experiment code attaches it after loading.
+        self.view_adapter = None
+        self._last_route_ids = None
+
+    def attach_camera_adapter(self, *, rank: int = 64, router_hidden: int = 128):
+        video_hidden_dim = int(self.full_config.framework.cosmos25.vl_hidden_dim)
+        state_dim = int(self.config.state_dim or 0)
+        self.view_adapter = CameraSupportedVelocityResidualAdapter(
+            action_hidden_dim=int(self.model.config.output_dim),
+            video_hidden_dim=video_hidden_dim,
+            state_dim=state_dim,
+            action_dim=int(self.action_dim),
+            rank=int(rank),
+            router_hidden=int(router_hidden),
+        ).to(device=self.device, dtype=torch.float32)
+        return self.view_adapter
 
     def sample_time(self, batch_size, device, dtype):
         sample = self.beta_dist.sample([batch_size]).to(device, dtype=dtype)
@@ -265,7 +282,16 @@ class FlowmatchingActionHead(nn.Module):
         return BatchFeature(data=batch)
 
 
-    def forward(self, vl_embs: torch.Tensor, actions: torch.Tensor, action_mask: torch.Tensor, state: torch.Tensor = None, encoder_attention_mask=None):
+    def forward(
+        self,
+        vl_embs: torch.Tensor,
+        actions: torch.Tensor,
+        action_mask: torch.Tensor,
+        state: torch.Tensor = None,
+        encoder_attention_mask=None,
+        token_layout: dict | None = None,
+        adapter_train_route: str | None = None,
+    ):
         """
         vl_embs: shape (B, seq_length, feature_dim)
         actions: shape (B, future_action_window_size, D_action)
@@ -300,17 +326,42 @@ class FlowmatchingActionHead(nn.Module):
             if state_features is not None else action_features
 
         # Join VLM features with state and action embedding along sequence dimension.
-        model_output = self.model(
-            hidden_states=sa_embs,
-            encoder_hidden_states=vl_embs,
-            encoder_attention_mask=encoder_attention_mask,
-            timestep=t_discretized,
-            return_all_hidden_states=False,  # NOTE (YL): not using flare now
-        )
-
-
-        pred = self.action_decoder(model_output)
-        pred_actions = pred[:, -actions.shape[1] :]
+        if adapter_train_route is None:
+            model_output = self.model(
+                hidden_states=sa_embs,
+                encoder_hidden_states=vl_embs,
+                encoder_attention_mask=encoder_attention_mask,
+                timestep=t_discretized,
+                return_all_hidden_states=False,  # NOTE (YL): not using flare now
+            )
+            pred = self.action_decoder(model_output)
+            pred_actions = pred[:, -actions.shape[1] :]
+        else:
+            if self.view_adapter is None:
+                raise RuntimeError("adapter_train_route was provided before attaching a camera adapter")
+            if token_layout is None:
+                raise RuntimeError("Camera adapter training requires a verified token_layout")
+            if adapter_train_route not in ("S", "W"):
+                raise ValueError(f"Expected expert training route S or W, got {adapter_train_route!r}")
+            with torch.no_grad():
+                model_output = self.model(
+                    hidden_states=sa_embs,
+                    encoder_hidden_states=vl_embs,
+                    encoder_attention_mask=encoder_attention_mask,
+                    timestep=t_discretized,
+                    return_all_hidden_states=False,
+                )
+                base_velocity = self.action_decoder(model_output)[:, -actions.shape[1] :]
+            action_hidden = model_output[:, -actions.shape[1] :].detach()
+            residual = self.view_adapter.residual(
+                adapter_train_route,
+                action_hidden,
+                vl_embs.detach(),
+                token_layout,
+                t[:, 0, 0],
+                state,
+            )
+            pred_actions = base_velocity + residual
 
         # Slice out only the action portion of pred and target.
         loss = ((pred_actions - velocity) ** 2) * action_mask
@@ -318,15 +369,42 @@ class FlowmatchingActionHead(nn.Module):
         return loss
 
     @torch.no_grad()
-    def predict_action(self, vl_embs: torch.Tensor, state: torch.Tensor = None) -> torch.Tensor:
+    def predict_action(
+        self,
+        vl_embs: torch.Tensor,
+        state: torch.Tensor = None,
+        token_layout: dict | None = None,
+        route_mode: str = "0",
+        initial_noise: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         # Set initial actions as the sampled noise.
         batch_size = vl_embs.shape[0]
         device = vl_embs.device
-        actions = torch.randn( # yes, here make sure action_horizon align with data loader? or share from clinet?
-            size=(batch_size, self.config.action_horizon, self.config.action_dim),
-            dtype=vl_embs.dtype,
-            device=device,
-        )
+        route_ids = torch.zeros(batch_size, device=device, dtype=torch.long)
+        if self.view_adapter is not None:
+            if token_layout is None:
+                raise RuntimeError("Camera adapter inference requires a verified token_layout")
+            if route_mode == "router":
+                route_ids = self.view_adapter.route_logits(vl_embs, token_layout, state).argmax(dim=-1)
+            elif route_mode in self.view_adapter.ROUTE_TO_INDEX:
+                route_ids.fill_(self.view_adapter.ROUTE_TO_INDEX[route_mode])
+            else:
+                raise ValueError(f"route_mode must be router, 0, S, or W, got {route_mode!r}")
+        elif route_mode not in ("0", "base", "router"):
+            raise ValueError("A fixed expert route was requested but no camera adapter is attached")
+        self._last_route_ids = route_ids.detach()
+
+        if initial_noise is None:
+            actions = torch.randn(
+                size=(batch_size, self.config.action_horizon, self.config.action_dim),
+                dtype=vl_embs.dtype,
+                device=device,
+            )
+        else:
+            expected = (batch_size, self.config.action_horizon, self.config.action_dim)
+            if tuple(initial_noise.shape) != expected:
+                raise ValueError(f"initial_noise shape {tuple(initial_noise.shape)} != {expected}")
+            actions = initial_noise.to(device=device, dtype=vl_embs.dtype).clone()
 
         num_steps = self.num_inference_timesteps
         dt = 1.0 / num_steps
@@ -363,6 +441,26 @@ class FlowmatchingActionHead(nn.Module):
             pred = self.action_decoder(model_output)
 
             pred_velocity = pred[:, -self.action_horizon :]
+
+            if self.view_adapter is not None and bool((route_ids != 0).any()):
+                if token_layout is None:
+                    raise RuntimeError("Camera adapter inference requires a verified token_layout")
+                tau = torch.full((batch_size,), float(t_cont), device=device, dtype=torch.float32)
+                pred_velocity = pred_velocity.clone()
+                for route, route_index in (("S", 1), ("W", 2)):
+                    selected = torch.nonzero(route_ids == route_index, as_tuple=False).flatten()
+                    if selected.numel() == 0:
+                        continue
+                    route_state = state.index_select(0, selected) if state is not None else None
+                    delta = self.view_adapter.residual(
+                        route,
+                        model_output.index_select(0, selected)[:, -self.action_horizon :],
+                        vl_embs.index_select(0, selected),
+                        token_layout,
+                        tau.index_select(0, selected),
+                        route_state,
+                    )
+                    pred_velocity[selected] = pred_velocity[selected] + delta.to(pred_velocity.dtype)
 
             # Update actions using euler integration (stepping from noise toward clean).
             actions = actions - dt * pred_velocity
